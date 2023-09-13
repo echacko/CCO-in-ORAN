@@ -299,14 +299,42 @@ class DDPG(CCOAlgorithm):
         )
 
         # The second half of the action is the downtilt for each sector
+        power_for_sectors = action[self.num_sectors:]
+
+        # Rescale the power to min and max power
+        power_for_sectors *= (self.power_range[1] - self.power_range[0])
+        power_for_sectors += self.power_range[0]
+
         # Clip the power to the min and max TX power
         power_for_sectors = np.clip(
-            action[self.num_sectors:],
+            power_for_sectors,
             self.power_range[0],
             self.power_range[1],
         )
 
         return (downtilt_for_sectors, power_for_sectors)
+
+    def get_reward_and_metrics(
+        self,
+        configuration: Tuple[np.ndarray, np.ndarray]
+    ) -> Tuple[float, Tuple[float, float]]:
+        '''Get the reward and metrics for the given configuration'''
+
+        # Get the rsrp and interferences powermap
+        rsrp_powermap, interference_powermap, _ = \
+            self.simulated_rsrp.get_RSRP_and_interference_powermap(configuration)
+
+        # According to the problem formulation, calculate the reward
+        reward = self.problem_formulation.get_objective_value(
+            rsrp_powermap, interference_powermap
+        )
+
+        # Get the metrics
+        metrics = self.problem_formulation.get_weak_over_coverage_area_percentages(
+            rsrp_powermap, interference_powermap
+        )
+
+        return reward, metrics
 
     def train_actor_and_critic(
         self,
@@ -372,19 +400,8 @@ class DDPG(CCOAlgorithm):
         # Get the action(configuration) from the target actor
         configuration = self.get_action(self.state, is_training=True)
 
-        # Get the rsrp and interferences powermap
-        rsrp_powermap, interference_powermap, _ = \
-            self.simulated_rsrp.get_RSRP_and_interference_powermap(configuration)
-
-        # According to the problem formulation, calculate the reward
-        reward = self.problem_formulation.get_objective_value(
-            rsrp_powermap, interference_powermap
-        )
-
-        # Get the metrics
-        metrics = self.problem_formulation.get_weak_over_coverage_area_percentages(
-            rsrp_powermap, interference_powermap
-        )
+        # Get the reward
+        reward, metrics = self.get_reward_and_metrics(configuration)
 
         # Add the transition to the replay buffer
         self.replay_buffer.store(
