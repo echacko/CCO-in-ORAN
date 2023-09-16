@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, List, Tuple
+from typing import Tuple
 
 import logging
 import numpy as np
@@ -146,7 +146,7 @@ class DDPG(CCOAlgorithm):
         def __init__(
             self,
             input_dim: int = 15,
-            output_dim: int = 30,
+            output_dim: Tuple[int, int] = (15, 11),
             hidden_dim: int = 64,
         ):
             super().__init__()
@@ -154,18 +154,44 @@ class DDPG(CCOAlgorithm):
             self.output_dim = output_dim
             self.hidden_dim = hidden_dim
 
-            self.layer1 = torch.nn.Linear(self.input_dim, self.hidden_dim)
-            self.layer2 = torch.nn.Linear(self.hidden_dim, self.hidden_dim)
-            self.layer3 = torch.nn.Linear(self.hidden_dim, self.output_dim)
+            # The input and hidden layers are common.
+            self.common = torch.nn.Sequential(
+                torch.nn.Linear(self.input_dim, self.hidden_dim),
+                torch.nn.ReLU(),
+                torch.nn.Linear(self.hidden_dim, self.hidden_dim),
+                torch.nn.ReLU(),
+            )
+
+            # The output layers
+            # Torch output layer with sigmoid activation for power
+            self.power_layer = torch.nn.Sequential(
+                torch.nn.Linear(self.hidden_dim, self.output_dim[0]),
+                torch.nn.Sigmoid(),
+            )
+
+            # Torch output layer with log softmax activation for downtilts
+            self.tilt_layer = torch.nn.ModuleList(
+                [
+                    torch.nn.Sequential(
+                        torch.nn.Linear(self.hidden_dim, self.output_dim[1]),
+                        torch.nn.LogSoftmax(dim=1),
+                    )
+                    for _ in range(self.output_dim[0])
+                ]
+            )
 
         def forward(self, x) -> torch.Tensor:
             '''Forward pass of the actor network'''
 
-            x = torch.relu(self.layer1(x))
-            x = torch.relu(self.layer2(x))
-            x = torch.tanh(self.layer3(x))
+            x = self.common(x)
+            power = self.power_layer(x)
+            tilt_probs = [layer(x) for layer in self.tilt_layer]
+            tilt = [torch.argmax(tilt_prob, dim=-1) for tilt_prob in tilt_probs]
+            tilt = torch.stack(tilt, dim=1)
 
-            return x
+            action = torch.cat([tilt, power], dim=1)
+
+            return action
 
     class Critic(torch.nn.Module):
         def __init__(
@@ -224,15 +250,18 @@ class DDPG(CCOAlgorithm):
         self.state = torch.ones(self.num_sectors, dtype=torch.float32).to(self.device)
         self.state_np = self.state.cpu().numpy()
 
+        # Number of available antenna downtilts
+        self.num_tilts = len(self.simulated_rsrp.downtilts_keys)
+
         self.actor = DDPG.Actor(
             input_dim=self.num_sectors,
-            output_dim=self.num_sectors*2,
+            output_dim=(self.num_sectors, self.num_tilts),
             hidden_dim=kwargs.get("hidden_dim", 64),
         ).to(self.device)
 
         self.actor_target = DDPG.Actor(
             input_dim=self.num_sectors,
-            output_dim=self.num_sectors*2,
+            output_dim=(self.num_sectors, self.num_tilts),
             hidden_dim=kwargs.get("hidden_dim", 64),
         ).to(self.device)
 
@@ -263,7 +292,7 @@ class DDPG(CCOAlgorithm):
 
         # Store experience in the replay buffer
         for _ in range(self.replay_buffer.batch_size):
-            configuration = self.get_action(self.state, is_training=True)
+            configuration = self.get_action(self.state, model_name='actor', is_training=True)
             rsrp_powermap, interference_powermap, _ = \
                 self.simulated_rsrp.get_RSRP_and_interference_powermap(configuration)
             reward = self.problem_formulation.get_objective_value(
@@ -279,27 +308,36 @@ class DDPG(CCOAlgorithm):
     def get_action(
         self,
         state: torch.Tensor,
-        is_training: bool = True
+        model_name: str,
+        is_training: bool = True,
         ) -> Tuple[np.ndarray, np.ndarray]:
-        '''Get the action from the actor'''
-        action = self.actor(state).detach().cpu().numpy()
+        '''Get the action from the actor (or target actior) network'''
+        if model_name == "actor":
+            model = self.actor
+        elif model_name == "actor_target":
+            model = self.actor_target
+        else:
+            raise ValueError("Model must be either 'actor' or 'actor_target'")
 
+        # Get the actions(powers and downtilts) from the actor network
+        state = state.unsqueeze(0)
+        action = model(state).cpu().detach().numpy()
+        downtilt_for_sectors = action[0, :self.num_sectors]
+        power_for_sectors = action[0, self.num_sectors:]
+
+        # Add exploration noise to the actions
         if is_training:
-            action += self.exploration_noise * np.random.randn(self.num_sectors*2)
-            action = np.clip(action, -1, 1)
+            power_for_sectors += self.exploration_noise * np.random.randn(*power_for_sectors.shape)
+            # For downtilts, the actions are discrete.
+            # Explore with probability exploration_noise
+            if np.random.rand() < self.exploration_noise:
+                downtilt_for_sectors = np.random.randint(
+                    int(self.downtilt_range[0]),
+                    int(self.downtilt_range[1]),
+                    self.num_sectors,
+                )
+
             self.exploration_noise *= self.exploration_noise_decay
-
-        # The first half of the action is the downtilts for each sector
-        # Discritize the downtilt to the nearest integer
-        downtilt_for_sector = np.round(action[:self.num_sectors])
-        downtilt_for_sectors = np.clip(
-            downtilt_for_sector,
-            self.downtilt_range[0],
-            self.downtilt_range[1],
-        )
-
-        # The second half of the action is the downtilt for each sector
-        power_for_sectors = action[self.num_sectors:]
 
         # Rescale the power to min and max power
         power_for_sectors *= (self.power_range[1] - self.power_range[0])
@@ -357,12 +395,18 @@ class DDPG(CCOAlgorithm):
         next_actions = self.actor_target(next_states)
 
         # Get the next Q values from the target critic
+        # TODO: Rescale actions if necessary
+        # BUG: The power values in actions form main actor is scaled to the
+        # actual power range. But the power values in the next_actions from
+        # the target actor is not scaled to the actual power range.
         next_Q = self.critic_target(next_states, next_actions)
 
         # Calculate the target Q values
         target_Q = rewards + self.gamma * next_Q
 
         # Get the current Q values from the critic
+        # TODO: Rescale actions if necessary
+        # BUG: This power is scaled to the range of actual power.
         current_Q = self.critic(states, actions)
 
         # Calculate the critic loss
@@ -374,6 +418,7 @@ class DDPG(CCOAlgorithm):
         self.critic_optimizer.step()
 
         # Calculate the actor loss
+        # TODO: Rescale actions if necessary
         actor_loss = -self.critic(states, self.actor(states)).mean()
 
         # Update the actor network
@@ -398,7 +443,7 @@ class DDPG(CCOAlgorithm):
 
     def step(self) -> Tuple[Tuple[np.ndarray, np.ndarray], float, Tuple[float, float]]:
         # Get the action(configuration) from the target actor
-        configuration = self.get_action(self.state, is_training=True)
+        configuration = self.get_action(self.state, model_name='actor', is_training=True)
 
         # Get the reward
         reward, metrics = self.get_reward_and_metrics(configuration)
