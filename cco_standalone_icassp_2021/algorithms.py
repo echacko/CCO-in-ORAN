@@ -241,7 +241,7 @@ class DDPG(CCOAlgorithm):
         self.gamma = kwargs.get("gamma", 0.99)
         self.target_tau = kwargs.get("target_tau", 0.005)
         self.exploration_noise = kwargs.get("exploration_noise", 1)
-        self.exploration_noise_decay = kwargs.get("exploration_noise_decay", 0.996)
+        self.exploration_noise_decay = kwargs.get("exploration_noise_decay", (1-4e-5))
         self.max_iterations = kwargs.get("max_iterations", 30000)
         self.lr = kwargs.get("lr", 0.001)
 
@@ -290,9 +290,10 @@ class DDPG(CCOAlgorithm):
             batch_size=kwargs.get("batch_size", 64),
         )
 
-        # Store experience in the replay buffer
+        # Store enough experiences in the replay buffer before training
         for _ in range(self.replay_buffer.batch_size):
-            configuration = self.get_action(self.state, model_name='actor', is_training=True)
+            action = self.get_action(self.state, is_training=True)
+            configuration = self.get_configuration(action)
             rsrp_powermap, interference_powermap, _ = \
                 self.simulated_rsrp.get_RSRP_and_interference_powermap(configuration)
             reward = self.problem_formulation.get_objective_value(
@@ -300,7 +301,7 @@ class DDPG(CCOAlgorithm):
             )
             self.replay_buffer.store(
                 self.state_np,
-                np.concatenate(configuration, axis=0),
+                np.concatenate(action, axis=0),
                 reward,
                 self.state_np
             )
@@ -308,20 +309,13 @@ class DDPG(CCOAlgorithm):
     def get_action(
         self,
         state: torch.Tensor,
-        model_name: str,
         is_training: bool = True,
         ) -> Tuple[np.ndarray, np.ndarray]:
-        '''Get the action from the actor (or target actior) network'''
-        if model_name == "actor":
-            model = self.actor
-        elif model_name == "actor_target":
-            model = self.actor_target
-        else:
-            raise ValueError("Model must be either 'actor' or 'actor_target'")
+        '''Get the action from the actor network'''
 
         # Get the actions(powers and downtilts) from the actor network
         state = state.unsqueeze(0)
-        action = model(state).cpu().detach().numpy()
+        action = self.actor(state).cpu().detach().numpy()
         downtilt_for_sectors = action[0, :self.num_sectors]
         power_for_sectors = action[0, self.num_sectors:]
 
@@ -333,14 +327,22 @@ class DDPG(CCOAlgorithm):
             if np.random.rand() < self.exploration_noise:
                 downtilt_for_sectors = np.random.randint(
                     int(self.downtilt_range[0]),
-                    int(self.downtilt_range[1]),
+                    int(self.downtilt_range[1]) + 1,
                     self.num_sectors,
                 )
 
             self.exploration_noise *= self.exploration_noise_decay
 
+        return (downtilt_for_sectors, power_for_sectors)
+
+    def get_configuration(
+        self,
+        action: Tuple[np.ndarray, np.ndarray],
+        ) -> Tuple[np.ndarray, np.ndarray]:
+        '''Rescale the predicted power and make the configuration'''
+
         # Rescale the power to min and max power
-        power_for_sectors *= (self.power_range[1] - self.power_range[0])
+        power_for_sectors = action[1] * (self.power_range[1] - self.power_range[0])
         power_for_sectors += self.power_range[0]
 
         # Clip the power to the min and max TX power
@@ -350,7 +352,7 @@ class DDPG(CCOAlgorithm):
             self.power_range[1],
         )
 
-        return (downtilt_for_sectors, power_for_sectors)
+        return (action[0], power_for_sectors)
 
     def get_reward_and_metrics(
         self,
@@ -395,18 +397,12 @@ class DDPG(CCOAlgorithm):
         next_actions = self.actor_target(next_states)
 
         # Get the next Q values from the target critic
-        # TODO: Rescale actions if necessary
-        # BUG: The power values in actions form main actor is scaled to the
-        # actual power range. But the power values in the next_actions from
-        # the target actor is not scaled to the actual power range.
         next_Q = self.critic_target(next_states, next_actions)
 
         # Calculate the target Q values
         target_Q = rewards + self.gamma * next_Q
 
         # Get the current Q values from the critic
-        # TODO: Rescale actions if necessary
-        # BUG: This power is scaled to the range of actual power.
         current_Q = self.critic(states, actions)
 
         # Calculate the critic loss
@@ -418,7 +414,6 @@ class DDPG(CCOAlgorithm):
         self.critic_optimizer.step()
 
         # Calculate the actor loss
-        # TODO: Rescale actions if necessary
         actor_loss = -self.critic(states, self.actor(states)).mean()
 
         # Update the actor network
@@ -442,8 +437,11 @@ class DDPG(CCOAlgorithm):
             )
 
     def step(self) -> Tuple[Tuple[np.ndarray, np.ndarray], float, Tuple[float, float]]:
-        # Get the action(configuration) from the target actor
-        configuration = self.get_action(self.state, model_name='actor', is_training=True)
+        # Get the action from the target actor
+        action = self.get_action(self.state, is_training=True)
+
+        # Get the configuration from the action
+        configuration = self.get_configuration(action)
 
         # Get the reward
         reward, metrics = self.get_reward_and_metrics(configuration)
@@ -451,7 +449,7 @@ class DDPG(CCOAlgorithm):
         # Add the transition to the replay buffer
         self.replay_buffer.store(
             self.state_np,
-            np.concatenate(configuration, axis=0),
+            np.concatenate(action, axis=0),
             reward,
             self.state_np
         )
