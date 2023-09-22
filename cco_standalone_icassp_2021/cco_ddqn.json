@@ -19,7 +19,7 @@
     },
     "algorithm":{
         "module":"algorithms",
-        "classname":"DDPG",
+        "classname":"DDQN",
         "parameters":{
           "hidden_dim": 2048,
           "gamma": 0,
